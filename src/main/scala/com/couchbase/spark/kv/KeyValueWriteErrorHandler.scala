@@ -36,11 +36,16 @@ case class KeyValueWriteErrorInfo(
   * This allows applications to define custom error handling behavior for all write operations
   * instead of having operations fail the entire job.
   *
-  * Error handlers are processed asynchronously through a background queue system, so blocking
-  * operations are permitted.  Each operation will block the queue until it completes.
+  * Blocking operations are permitted. The handler is called on a thread of its own, one error at a
+  * time, and the write waits for each call, so a slow handler slows the write down. A call that
+  * takes longer than [[KeyValueOptions.ErrorHandlerTimeout]] fails the Spark task.
   *
   * See ExampleErrorHandler.
+  *
+  * [[KeyValueWriteFailureHandler]] is the newer interface, and is preferred: it can also decide to
+  * ignore a failure or fail the Spark task, and is given more about each failure.
   */
+@deprecated("KeyValueWriteFailureHandler is the newer and preferred interface")
 trait KeyValueWriteErrorHandler extends Serializable {
 
   /** Called when an error occurs during a write operation.
