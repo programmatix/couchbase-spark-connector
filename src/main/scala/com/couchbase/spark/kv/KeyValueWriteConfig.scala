@@ -17,6 +17,7 @@ package com.couchbase.spark.kv
 
 import com.couchbase.spark.util.Redaction
 
+import scala.concurrent.duration.FiniteDuration
 import scala.runtime.ScalaRunTime
 
 case class KeyValueWriteConfig(
@@ -33,9 +34,21 @@ case class KeyValueWriteConfig(
     errorScope: Option[String],
     errorCollection: Option[String],
     writeMode: Option[String],
-    maxConcurrentOps: Int
+    maxConcurrentOps: Int,
+    retryAttempts: Int = 0,
+    // KeyValueOptions.IdempotencyEnabled when idempotency is enabled.
+    idempotency: Option[String] = None,
+    // Set when idempotency is enabled for a sub-document write mode, the only ones that use it.
+    writeId: Option[String] = None,
+    // The "errorHandler.*" options, for the error handler: keys lower-cased, without the prefix.
+    errorHandlerOptions: Map[String, String] = Map.empty,
+    errorHandlerTimeout: FiniteDuration = FailureHandlerRunner.DefaultCallTimeout
 ) {
+  // The error handler's option values may be credentials, so only their names are logged.
   override def toString: String = ScalaRunTime._toString(
-    copy(connectionIdentifier = Redaction.connectionIdentifier(connectionIdentifier))
+    copy(
+      connectionIdentifier = Redaction.connectionIdentifier(connectionIdentifier),
+      errorHandlerOptions = errorHandlerOptions.map { case (k, _) => k -> "<redacted>" }
+    )
   )
 }

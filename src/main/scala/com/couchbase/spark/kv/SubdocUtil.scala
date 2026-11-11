@@ -166,13 +166,47 @@ private[couchbase] object SubdocUtil {
     }
   }
 
-  def validate(schema: StructType, idFieldName: String, casFieldNameOpt: Option[String]): Unit = {
+   /** Operations that change the document again each time they are repeated. */
+  private val NonIdempotentOps: Set[SubdocOperation] =
+    Set(ArrayAppend, ArrayPrepend, ArrayInsert, Increment, Decrement)
+
+  /** Whether repeating this row's sub-document specs is safe: it can't change the document a second
+    * time. Upsert and replace specs leave the document the same, and insert, remove and
+    * arrayAddUnique fail if repeated (PathExists / PathNotFound) without changing anything. Array
+    * inserts and counters are applied again.
+    *
+    * This only considers the specs. CAS or insert document semantics also make any write safe to
+    * repeat, as a repeat then fails.
+    */
+  def isReplaySafe(decoded: JsonObject): Boolean =
+    !decoded.names.exists(fieldName => NonIdempotentOps.contains(operationOf(fieldName)))
+
+  private def operationOf(fieldName: String): SubdocOperation = {
+    val splitIdx = fieldName.indexOf(":")
+    if (splitIdx == -1) Upsert else parseOperation(fieldName.substring(0, splitIdx).toLowerCase)
+  }
+
+  /** @param reservedSpecs how many of the 16 specs the connector itself needs, e.g. for
+    *                      [[KeyValueOptions.Idempotency]].
+    */
+  def validate(
+      schema: StructType,
+      idFieldName: String,
+      casFieldNameOpt: Option[String],
+      reservedSpecs: Int = 0
+  ): Unit = {
     val nonSpecialCols =
       schema.fields.filter(f => f.name != idFieldName && !casFieldNameOpt.contains(f.name))
 
-    if (nonSpecialCols.length > MaxSpecs) {
+    val maxColumns = MaxSpecs - reservedSpecs
+    if (nonSpecialCols.length > maxColumns) {
+      val reservedNote =
+        if (reservedSpecs > 0) {
+          s" (of $MaxSpecs, $reservedSpecs are used by KeyValueOptions.Idempotency)"
+        } else ""
       throw new IllegalArgumentException(
-        s"Sub-document operations support maximum $MaxSpecs specs but ${nonSpecialCols.length} columns provided"
+        s"Sub-document operations support maximum $maxColumns specs$reservedNote but " +
+          s"${nonSpecialCols.length} columns provided"
       )
     }
 

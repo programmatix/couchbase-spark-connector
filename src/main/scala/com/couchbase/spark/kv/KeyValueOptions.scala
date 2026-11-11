@@ -143,8 +143,10 @@ object KeyValueOptions {
    * may be available on all every operation. Applications should handle missing fields gracefully.
    * In particular the contents of the "context" field should not be relied upon.
    *
-   * The bucket, scope, and collection must already exist, otherwise these error documents will be
-   * unable to be written.
+   * The bucket, scope, and collection must already exist, and the user must be able to write to
+   * them. This is checked before the write starts, and the write fails if not, before writing
+   * anything. A bucket that can't be opened is waited for first, for up to
+   * `spark.couchbase.waitUntilReadyTimeout` (1 minute by default).
    *
    * IMPORTANT: When ErrorBucket is specified, individual write operation failures will no longer
    * cause the entire Spark job to fail.
@@ -152,11 +154,18 @@ object KeyValueOptions {
    * Some validation failures that occur before the write operations commence will intentionally continue to fast-fail
    * the Spark job, and will not trigger this error handler.
    *
-   * Both ErrorBucket and ErrorHandler may be used together.
+   * Both ErrorBucket and ErrorHandler may be used together. A [[KeyValueWriteFailureHandler]] then
+   * decides first, and error documents are only written for failures it continues with.
    *
-   * Note that error processing is handled by a bounded background queue, on the Spark executor.
-   * If this queue is exceeded, additional failures will be discarded with a warning logged in the executor logs.
-   * This prevents excessive memory usage during pathological error conditions.
+   * Error documents are written one at a time per Spark task, and the write waits for each, so if
+   * they can't be written as fast as failures occur, the write slows down to match, rather than
+   * discarding failures.
+   *
+   * Error documents are written while writes are failing, which is quite likely because the
+   * cluster is struggling, so writing one is retried, with a backoff between attempts that grows
+   * to 5 seconds, until it succeeds or [[ErrorHandlerTimeout]] has nearly passed. Only then does
+   * the Spark task fail, rather than the failure being lost. Each attempt writes the same document,
+   * so an attempt that timed out but was in fact applied does not leave a duplicate.
    */
   val ErrorBucket = "errorBucket"
 
@@ -174,24 +183,45 @@ object KeyValueOptions {
 
   /** Option Key: an error handler class name for handling write operation errors.
     *
-    * The value should be a fully qualified class name that implements KeyValueWriteErrorHandler.  The class code must be
-    * present on the classpath of what the Spark executor is given to run.
+    * The value should be a fully qualified class name that implements
+    * [[KeyValueWriteFailureHandler]], or the older [[KeyValueWriteErrorHandler]]. The class code
+    * must be present on the classpath of what the Spark executor is given to run.
     *
-    * When ErrorHandler is specified, individual write operation failures will no longer
-    * cause the entire Spark job to fail.
+    * When ErrorHandler is specified, an individual write operation failure no longer fails the
+    * Spark job by default: the handler decides. A [[KeyValueWriteFailureHandler]] can ignore it,
+    * carry on, or fail the Spark task. A [[KeyValueWriteErrorHandler]] always carries on.
+    *
+    * Options for the handler can be given to the write as `errorHandler.<name>`, and are available
+    * to a [[KeyValueWriteFailureHandler]] from [[KeyValueWriteContext.option]].
     *
     * Some validation failures that occur before the write operations commence will intentionally continue to fast-fail
     * the Spark job, and will not trigger this error handler.
     *
     * Note the ErrorHandler will be run on the Spark executor - NOT the main application.  See
-    * [[com.couchbase.spark.kv.ErrorHandler]] for why this is important, and for the limitations it
-    * creates.  Users should prefer ErrorBucket for error handling.
+    * [[KeyValueWriteFailureHandler]] for why this is important.
     *
-    * Note that error processing is handled by a bounded background queue, on the Spark executor.
-    * If this queue is exceeded, additional failures will be discarded with a warning logged in the executor logs.
-    * This prevents excessive memory usage during pathological error conditions.
+    * The handler is called one failure at a time per Spark task, on a thread of its own, and the
+    * write waits for each call. So a slow handler intentionally slows the write down. A handler
+    * that prefers to do slow work asynchronously can pass failures to a thread of its own.
+    *
+    * A handler call that takes longer than [[ErrorHandlerTimeout]] fails the Spark task.
     */
   val ErrorHandler = "errorHandler"
+
+  /** Option Key: how long a single call to the [[ErrorHandler]], or a write of an [[ErrorBucket]]
+    * document, may take before the Spark task fails.
+    *
+    * An [[ErrorBucket]] document is retried for up to this long, less a moment, so that the error
+    * reported is that the document could not be written. When there's also an [[ErrorHandler]],
+    * the error document gets this long on top of the time the handler took to decide.
+    *
+    * Defaults to 2 minutes. The value is a string and must be parsable as a scala Duration, such as
+    * "5m".
+    *
+    * This applies to each call separately, including the handler's `close`. A handler that does
+    * slow work there, such as uploading a file of the failures it recorded, may need longer.
+    */
+  val ErrorHandlerTimeout = "errorHandlerTimeout"
 
   /** Option Key: How many KV write operations each Spark partition keeps in-flight at once.
     *
@@ -209,6 +239,111 @@ object KeyValueOptions {
     * 128,000 operations per second.
     */
   val MaxConcurrentOps = "maxConcurrentOps"
+
+  /** Option Key: how many times the connector retries a failed KV write operation before giving up
+    * on it.
+    *
+    * Defaults to 0: no retries, which is the behaviour of earlier versions.
+    *
+    * Note the SDK already retries many transient failures internally (such as the server
+    * temporarily rejecting writes), until the operation's [[Timeout]]. This option adds retries on
+    * top of that, after the operation has failed or timed out. Each retry waits with exponential
+    * backoff (100ms doubling up to 5s, with jitter).
+    *
+    * Only failures that are safe to retry are retried:
+    *   - Failures where the server definitely did not apply the operation, such as an
+    *     UnambiguousTimeoutException or TemporaryFailureException, are always retryable.
+    *   - Failures where the operation may or may not have been applied, such as an
+    *     AmbiguousTimeoutException, are retried unless repeating an applied operation would change
+    *     the document a second time. That is only the case for sub-document writes containing
+    *     arrayAppend, arrayPrepend, arrayInsert, increment or decrement specs, without CAS, not
+    *     using [[WriteModeSubdocInsert]], and without [[Idempotency]] enabled. These are not
+    *     retried after an ambiguous failure.  To have these retried also, enable [[Idempotency]].
+    *
+    *     All other writes are safe to repeat: either a repeat leaves the document the same (upserts,
+    *     replaces), or it fails without changing anything (a CAS write finds the CAS has moved, an
+    *     insert finds the document exists, a sub-document insert or remove finds the path already
+    *     inserted or removed).
+    *   - Other failures, such as DocumentNotFoundException, are not retried.
+    *
+    * A [[KeyValueWriteFailureHandler]] set with [[ErrorHandler]] can override this for each failed
+    * attempt, with its `onAttemptFailed` method.
+    *
+    * When a write fails in a way that suggests the cluster is struggling (a timeout, or the server
+    * being temporarily unable to take writes), every writer in the Spark task also waits before
+    * its next operation, whether that's a retry or not, until writes start succeeding again. This
+    * reduces the load the write puts on the cluster, rather than adding retries to it.
+    *
+    * Once an operation has failed and will not be retried, it is handled exactly as it would be
+    * without this option: passed to the [[ErrorHandler]] / [[ErrorBucket]] if configured, and
+    * otherwise failing the Spark task.  With current Spark defaults, Spark will then retry the
+    * task up to 3 times (`spark.task.maxFailures` defaults to 4 attempts in total; note that in
+    * local mode it defaults to 1, so the task is not retried).
+    *
+    * The value must be a non-negative integer.
+    */
+  val RetryAttempts = "retryAttempts"
+
+  /** Option Key: makes more write operations idempotent - safe to repeat - than they are by
+    * default, so that a write repeated after an ambiguous failure (by [[RetryAttempts]]), or because
+    * Spark retried a task or stage, is not applied twice.
+    *
+    * Defaults to [[IdempotencyNone]].
+    *
+    * Sub-document writes ([[WriteModeSubdocUpsert]], [[WriteModeSubdocReplace]] and
+    * [[WriteModeSubdocInsert]]): this matters most for sub-document operations that are not
+    * naturally idempotent, such as arrayAppend, arrayPrepend, arrayInsert, increment and decrement.
+    * The connector generates an idempotency key for each row, and stores it alongside the
+    * document, so that it can tell whether a write was actually applied if it needs to be repeated.
+    * This works across Spark's task and stage retries. It uses a small amount of metadata per
+    * document (under 100 bytes, in an extended attribute named `cbspark`), and uses 2 of the 16
+    * specs a sub-document write allows, so the DataFrame can have at most 14 sub-document columns.
+    *
+    * Full-document inserts (SaveMode.ErrorIfExists and SaveMode.Ignore) and replaces using CAS
+    * ([[CasFieldName]]): repeating one that was already applied fails, as the document now exists
+    * or its CAS has changed. With this option, the connector then reads the document, and if its
+    * content is already exactly what the row would write, the row is treated as written rather
+    * than failed. Nothing extra is stored, and the read is only made on such a failure. A document
+    * that someone else changed to the same content is also treated as written. If the read fails
+    * (e.g. it times out), the write is retried like any other failure, per [[RetryAttempts]].
+    *
+    * Other writes (upserts, and replaces without CAS) are already safe to repeat, and are
+    * unaffected.
+    */
+  val Idempotency = "idempotency"
+
+  /** Option value: no idempotency - to be used with [[Idempotency]] as the key. The default. */
+  val IdempotencyNone = "none"
+
+  /** Option value: idempotency enabled - to be used with [[Idempotency]] as the key. */
+  val IdempotencyEnabled = "enabled"
+
+  /** Option Key: an advanced option for a somewhat niche case: re-running a Spark job whose write failed
+    * part-way through, without applying the rows it had already written a second time. Only
+    * relevant for sub-document writes with [[Idempotency]] enabled, and most users will not need
+    * it. (Full-document writes with [[Idempotency]] do not need it: they compare content instead.)
+    *
+    * Each write is identified by a WriteId, which is part of every row's idempotency key. If not
+    * specified, a random one is generated for each write, and logged by the Spark driver. All of
+    * Spark's own task and stage retries within that job share it, so they need nothing extra.
+    *
+    * A job that is re-submitted after failing is a new write, with a new WriteId, so rows the
+    * failed job had already applied would be applied again. To avoid that, re-run the job with this
+    * option set to the WriteId logged by the failed job, and with the same input data.
+    *
+    * Note this does not resume the job from where it failed: every row is written again. For each
+    * row, the idempotency key is used to detect whether the failed job had already applied it, and if
+    * so it is skipped rather than applied a second time.
+    *
+    * If error handling is enabled ([[ErrorHandler]] or [[ErrorBucket]]), individual write failures
+    * do not fail the job unless the handler decides to, so jobs failing part-way through are not
+    * expected and this option should not be needed except to support extreme cases such as Sparker
+    * worker failure.
+    *
+    * Must be 1 to 64 characters from A-Z, a-z, 0-9, '-' and '_'. Only valid when [[Idempotency]] is
+    * enabled.
+    */
+  val WriteId = "writeId"
 
   /** Option value: Majority Durability - to be used with [[Durability]] as the key.
     */

@@ -15,7 +15,11 @@
  */
 package com.couchbase.spark.kv
 
-import com.couchbase.client.core.error.{CouchbaseException, DocumentExistsException}
+import com.couchbase.client.core.error.{
+  CasMismatchException,
+  CouchbaseException,
+  DocumentExistsException
+}
 import com.couchbase.client.scala.Collection
 import com.couchbase.client.scala.codec.RawJsonTranscoder
 import com.couchbase.client.scala.durability.Durability
@@ -54,7 +58,7 @@ import java.util
 import java.util.concurrent.{ArrayBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.collection.mutable
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.util.{Failure, Success, Try}
 
 class KeyValueTableProvider
@@ -90,6 +94,9 @@ class KeyValueTableProvider
         m == KeyValueOptions.WriteModeSubdocReplace ||
         m == KeyValueOptions.WriteModeSubdocUpsert
     )
+    // Parsed here on the driver, so that a generated WriteId is the same for every task.
+    val config = writeConfig(parameters.asJava, couchbaseConfig)
+
     if (isSubdocMode) {
       val idFieldName =
         parameters.getOrElse(KeyValueOptions.IdFieldName, DefaultConstants.DefaultIdFieldName)
@@ -97,12 +104,22 @@ class KeyValueTableProvider
       SubdocUtil.validate(
         data.schema,
         idFieldName,
-        casFieldOpt
+        casFieldOpt,
+        IdempotentWrites.specsUsed(config.idempotency)
       )
     }
+
+    config.writeId.foreach { id =>
+      logInfo(
+        s"KV dataframe write using KeyValueOptions.WriteId '$id'.  If this write fails, it can be " +
+          s"safely re-run on the same input by setting KeyValueOptions.WriteId to '$id': rows that " +
+          "were already applied will be skipped."
+      )
+    }
+
     data.toJSON.foreachPartition(
       new RelationPartitionWriter(
-        writeConfig(parameters.asJava, couchbaseConfig),
+        config,
         couchbaseConfig,
         mode
       )
@@ -141,6 +158,54 @@ class KeyValueTableProvider
         )
     }
 
+    val retryAttempts = Option(properties.get(KeyValueOptions.RetryAttempts)) match {
+      case None => 0
+      case Some(v) =>
+        v.trim.toIntOption.filter(_ >= 0).getOrElse(
+          throw new IllegalArgumentException(
+            s"KeyValueOptions.RetryAttempts must be a non-negative integer, but was: $v"
+          )
+        )
+    }
+
+    val errorHandlerTimeout = Option(properties.get(KeyValueOptions.ErrorHandlerTimeout)) match {
+      case None => FailureHandlerRunner.DefaultCallTimeout
+      case Some(v) =>
+        Try(Duration(v.trim)).toOption
+          .collect { case d: FiniteDuration if d > Duration.Zero => d }
+          .getOrElse(
+            throw new IllegalArgumentException(
+              s"KeyValueOptions.ErrorHandlerTimeout must be a positive duration such as '5m', " +
+                s"but was: $v"
+            )
+          )
+    }
+
+    val isSubdoc = writeMode.exists(m =>
+      m == KeyValueOptions.WriteModeSubdocInsert ||
+        m == KeyValueOptions.WriteModeSubdocReplace ||
+        m == KeyValueOptions.WriteModeSubdocUpsert
+    )
+
+    val idempotency = Option(properties.get(KeyValueOptions.Idempotency)) match {
+      case None | Some(KeyValueOptions.IdempotencyNone) => None
+      case Some(v @ KeyValueOptions.IdempotencyEnabled) => Some(v)
+      case Some(v) =>
+        throw new IllegalArgumentException("Unknown KeyValueOptions.Idempotency option: " + v)
+    }
+
+    // Only sub-document writes store an idempotency key, so only they need a WriteId.
+    // Full-document writes compare the document's content instead.
+    val usesWriteId = idempotency.isDefined && isSubdoc
+    val writeId = Option(properties.get(KeyValueOptions.WriteId)) match {
+      case Some(_) if idempotency.isEmpty =>
+        throw new IllegalArgumentException(
+          "KeyValueOptions.WriteId can only be used when KeyValueOptions.Idempotency is enabled"
+        )
+      case Some(id) => Some(IdempotentWrites.validateWriteId(id)).filter(_ => usesWriteId)
+      case None     => if (usesWriteId) Some(IdempotentWrites.generateWriteId()) else None
+    }
+
     KeyValueWriteConfig(
       conf.implicitBucketNameOr(properties.get(KeyValueOptions.Bucket)),
       conf.implicitScopeNameOr(properties.get(KeyValueOptions.Scope)),
@@ -156,7 +221,12 @@ class KeyValueTableProvider
       Option(properties.get(KeyValueOptions.ErrorScope)),
       Option(properties.get(KeyValueOptions.ErrorCollection)),
       writeMode,
-      maxConcurrentOps
+      maxConcurrentOps,
+      retryAttempts,
+      idempotency,
+      writeId,
+      WriteContext.handlerOptions(properties.asScala),
+      errorHandlerTimeout
     )
   }
 
@@ -269,38 +339,38 @@ class RelationPartitionWriter(
 ) extends ForeachPartitionFunction[String]
     with Logging {
 
-  private val (errorHandler, errorDocumentHandler)
-      : (Option[KeyValueWriteErrorHandler], Option[KeyValueErrorDocumentHandler]) = {
-    val regularHandler = writeConfig.errorHandler.map(validateAndInstantiateCustomErrorHandler)
-    val documentHandler =
-      writeConfig.errorBucket.map(_ =>
-        new KeyValueErrorDocumentHandler(writeConfig, couchbaseConfig)
-      )
-    (regularHandler, documentHandler)
+  // Created here on the driver, so that a handler class that is missing or can't be created fails
+  // the write before anything is written.
+  private val userHandler: Option[KeyValueWriteFailureHandler] =
+    writeConfig.errorHandler.map(validateAndInstantiateCustomErrorHandler)
+
+  // Checked here too, so that a missing collection fails the write at once, rather than each
+  // failure retrying its error document until it times out.
+  private val errorBucket: Option[KeyValueErrorDocumentHandler] = writeConfig.errorBucket.map {
+    _ =>
+      val handler = new KeyValueErrorDocumentHandler(writeConfig, couchbaseConfig)
+      handler.checkCanWrite()
+      handler
   }
+
+  private def hasFailureHandling = userHandler.isDefined || errorBucket.isDefined
 
   private val loggedSubdocSpecs = new AtomicBoolean(false)
 
-  // transient lazy defers this until it's run on the executor. Required as ErrorQueueManager is not serializable.
-  @transient private lazy val errorQueueManager =
-    new ErrorQueueManager(
-      errorHandler,
-      errorDocumentHandler,
-      RelationPartitionWriter.partitionLabel(TaskContext.get())
-    )
-
   private def validateAndInstantiateCustomErrorHandler(
       className: String
-  ): KeyValueWriteErrorHandler = {
+  ): KeyValueWriteFailureHandler = {
     try {
-      val clazz    = Class.forName(className)
-      val instance = clazz.getDeclaredConstructor().newInstance()
-      if (!instance.isInstanceOf[KeyValueWriteErrorHandler]) {
-        throw new IllegalArgumentException(
-          s"Error handler class $className does not implement KeyValueWriteErrorHandler"
-        )
+      val clazz = Class.forName(className)
+      clazz.getDeclaredConstructor().newInstance() match {
+        case h: KeyValueWriteFailureHandler => h
+        case h: KeyValueWriteErrorHandler   => new LegacyErrorHandlerAdapter(h)
+        case _ =>
+          throw new IllegalArgumentException(
+            s"Error handler class $className does not implement KeyValueWriteErrorHandler or " +
+              "KeyValueWriteFailureHandler"
+          )
       }
-      instance.asInstanceOf[KeyValueWriteErrorHandler]
     } catch {
       case _: ClassNotFoundException =>
         throw new IllegalArgumentException(s"Error handler class not found: $className")
@@ -311,6 +381,11 @@ class RelationPartitionWriter(
       case _: IllegalAccessException =>
         throw new IllegalArgumentException(
           s"Error handler class $className constructor is not accessible"
+        )
+      case e: java.lang.reflect.InvocationTargetException =>
+        throw new IllegalArgumentException(
+          s"Error handler class $className constructor failed: ${e.getCause}",
+          e.getCause
         )
       case e: IllegalArgumentException =>
         throw e // Re-throw our custom messages
@@ -323,18 +398,43 @@ class RelationPartitionWriter(
   }
 
   override def call(t: util.Iterator[String]): Unit = {
-    // Force creation here on the task thread, as it labels itself from Spark's ThreadLocal TaskContext.
-    errorQueueManager
-
-    val partitionId = Option(TaskContext.get()).map(_.partitionId()).getOrElse(-1)
-    val partition   = RelationPartitionWriter.partitionLabel(TaskContext.get())
+    val ctx            = TaskContext.get()
+    val partitionId    = Option(ctx).map(_.partitionId()).getOrElse(-1)
+    val partition      = RelationPartitionWriter.partitionLabel(ctx)
+    val scopeName      = writeConfig.scope.getOrElse(DefaultConstants.DefaultScopeName)
+    val collectionName = writeConfig.collection.getOrElse(DefaultConstants.DefaultCollectionName)
     logInfo(s"Partition ${partition}: KV dataframe write starting")
 
-    val stats = new PartitionWriteStats(partition, s"couchbase-kv-stats-partition-$partitionId")
+    val stats = new PartitionWriteStats(
+      partition,
+      s"couchbase-kv-stats-partition-$partitionId",
+      hasErrorHandler = hasFailureHandling
+    )
+    val partitionFailed = new AtomicBoolean(false)
+    val backoff         = new PartitionBackoff(stats, () => partitionFailed.get())
 
+    val failures =
+      if (!hasFailureHandling) None
+      else {
+        Some(
+          RelationPartitionWriter.Failures(
+            new FailureHandlerRunner(
+              userHandler.getOrElse(FailureHandlerRunner.ContinueHandler),
+              partition,
+              s"couchbase-kv-error-handler-partition-$partitionId",
+              partitionFailed,
+              stats,
+              writeConfig.errorHandlerTimeout,
+              errorBucket
+            ),
+            decidesRetries = FailureHandlerRunner.decidesRetries(userHandler)
+          )
+        )
+      }
+
+    var error: Option[Throwable] = None
     try {
-      val scopeName      = writeConfig.scope.getOrElse(DefaultConstants.DefaultScopeName)
-      val collectionName = writeConfig.collection.getOrElse(DefaultConstants.DefaultCollectionName)
+      failures.foreach(_.runner.open(writeContext(ctx, scopeName, collectionName)))
 
       val coll = CouchbaseConnection(writeConfig.connectionIdentifier)
         .cluster(couchbaseConfig)
@@ -361,25 +461,69 @@ class RelationPartitionWriter(
         t.asScala,
         writeConfig.maxConcurrentOps,
         i => s"couchbase-kv-writer-partition-$partitionId-$i",
-        stats
+        stats,
+        partitionFailed
       ) { encoded =>
-        write(coll, durability, encoded, stats)
+        write(coll, durability, encoded, stats, () => partitionFailed.get(), failures, backoff)
       }
 
       logInfo(s"Partition ${partition}: KV dataframe write completed processing $count documents")
     } catch {
-      case err: Throwable =>
-        logError(
-          s"Partition ${partition}: KV dataframe write failed due to " +
-            PartitionWriteStats.describe(err)
-        )
-        // Must be rethrown, so that Spark fails (and retries) the task.
-        throw err
-    } finally {
-      logInfo(s"Partition ${partition}: KV dataframe write finishing")
-      stats.close()
-      errorQueueManager.shutdown()
+      case err: Throwable => error = Some(err)
     }
+
+    // If the handler failed the partition, that is the real reason, rather than a writer thread
+    // finding it had stopped.
+    failures.foreach(_.runner.failed.foreach { handlerError =>
+      error = error match {
+        case None | Some(_: PartitionStoppedException) => Some(handlerError)
+        case Some(e) =>
+          if (e ne handlerError) e.addSuppressed(handlerError)
+          Some(e)
+      }
+    })
+
+    failures.foreach { f =>
+      try f.runner.close(error)
+      catch {
+        case e: Throwable =>
+          error match {
+            case None           => error = Some(e)
+            case Some(existing) => if (existing ne e) existing.addSuppressed(e)
+          }
+      }
+    }
+
+    logInfo(s"Partition ${partition}: KV dataframe write finishing")
+    stats.close()
+
+    error.foreach { err =>
+      logError(
+        s"Partition ${partition}: KV dataframe write failed due to " +
+          PartitionWriteStats.describe(err)
+      )
+      // Must be rethrown, so that Spark fails (and retries) the task.
+      throw err
+    }
+  }
+
+  private def writeContext(
+      ctx: TaskContext,
+      scope: String,
+      collection: String
+  ): KeyValueWriteContext = {
+    def get(f: TaskContext => Int): Int = Option(ctx).map(f).getOrElse(-1)
+    WriteContext(
+      partitionId = get(_.partitionId()),
+      stageId = get(_.stageId()),
+      stageAttemptNumber = get(_.stageAttemptNumber()),
+      taskAttemptNumber = get(_.attemptNumber()),
+      bucket = writeConfig.bucket,
+      scope = scope,
+      collection = collection,
+      writeId = writeConfig.writeId,
+      options = writeConfig.errorHandlerOptions
+    )
   }
 
   private def toKeyValue(encoded: String): (String, JsonObject, Option[Long]) = {
@@ -416,12 +560,18 @@ class RelationPartitionWriter(
       coll: Collection,
       durability: Durability,
       encoded: String,
-      stats: PartitionWriteStats
+      stats: PartitionWriteStats,
+      partitionFailed: () => Boolean,
+      failures: Option[RelationPartitionWriter.Failures],
+      backoff: PartitionBackoff
   ): Unit = {
     val conversionStarted  = System.nanoTime()
     val (id, decoded, cas) = toKeyValue(encoded)
+    // For the reads that check whether a conflicting write was this row's own.
+    val timeout = writeConfig.timeout.map(Duration(_))
 
-    val op: () => Try[_] = writeConfig.writeMode match {
+    // `replaySafe`: whether repeating the operation, when it may already have been applied, is safe.
+    val (op, replaySafe): (() => Try[WriteRetry.Outcome], Boolean) = writeConfig.writeMode match {
       case Some(KeyValueOptions.WriteModeSubdocInsert) |
           Some(KeyValueOptions.WriteModeSubdocReplace) |
           Some(KeyValueOptions.WriteModeSubdocUpsert) => {
@@ -436,26 +586,84 @@ class RelationPartitionWriter(
         if (loggedSubdocSpecs.compareAndSet(false, true)) {
           logInfo(
             s"Partition ${stats.partition}: performing subdoc mutations with ${storeSemantics}, " +
-              s"specs for the first document: ${debugInfo}"
+              s"specs for the first document: ${debugInfo}" +
+              writeConfig.idempotency.fold("")(m =>
+                s", plus idempotency '$m' with writeId '${writeConfig.writeId.get}'"
+              )
           )
         }
 
         val opts = buildMutateInOptions(durability, storeSemantics, cas)
-        () => coll.mutateIn(id, specs, opts)
+
+        writeConfig.idempotency match {
+          case Some(_) =>
+            val writeId = writeConfig.writeId.get
+            val rowKey  = IdempotentWrites.rowKey(encoded)
+            val op = () => {
+              val allSpecs =
+                IdempotentWrites.markerSpecs(writeId, rowKey, System.currentTimeMillis()) ++ specs
+              val result: Try[WriteRetry.Outcome] =
+                coll.mutateIn(id, allSpecs, opts).map(_ => WriteRetry.Applied)
+              result.recoverWith {
+                // The key is already in the document: this row has been applied before.
+                case e if IdempotentWrites.isGuardRejection(e) => Success(WriteRetry.Deduplicated)
+                // With insert semantics or CAS, a repeat fails before the guard is evaluated.  Only
+                // now is it worth reading the document, to see whether it was this row that applied.
+                case e @ (_: DocumentExistsException | _: CasMismatchException) =>
+                  IdempotentWrites.resolveConflict(
+                    e,
+                    IdempotentWrites.markerPresent(
+                      coll,
+                      id,
+                      IdempotentWrites.markerPath(writeId, rowKey),
+                      timeout
+                    )
+                  )
+              }
+            }
+            (op, true)
+
+          case None =>
+            // With CAS or insert semantics a repeat of an applied write fails (the CAS has moved,
+            // or the document exists) rather than applying the specs again, so any specs are safe.
+            val safe = cas.isDefined || storeSemantics == StoreSemantics.Insert ||
+              SubdocUtil.isReplaySafe(decoded)
+            (() => coll.mutateIn(id, specs, opts).map(_ => WriteRetry.Applied), safe)
+        }
       }
 
       case _ =>
         val content = decoded.toString
+
+        // With Idempotency, a conflict may just mean this row was already applied: by an earlier
+        // attempt that failed ambiguously, an earlier Spark task attempt, or a re-run.  There is no
+        // idempotency key to check, but the document then holds exactly this row's content.
+        def checkingContent(op: () => Try[WriteRetry.Outcome]): () => Try[WriteRetry.Outcome] =
+          if (writeConfig.idempotency.isEmpty) op
+          else
+            () =>
+              op().recoverWith {
+                case e @ (_: DocumentExistsException | _: CasMismatchException) =>
+                  IdempotentWrites.resolveConflict(
+                    e,
+                    IdempotentWrites.contentMatches(coll, id, content, timeout)
+                  )
+              }
+
         (writeConfig.writeMode, mode) match {
           case (Some(KeyValueOptions.WriteModeReplace), _) =>
             val opts = buildReplaceOptions(durability, cas)
-            () => coll.replace(id, content, opts)
+            // Without CAS a repeat writes the same content; with CAS it fails, as the CAS has moved.
+            val op = () => coll.replace(id, content, opts).map(_ => WriteRetry.Applied)
+            (if (cas.isDefined) checkingContent(op) else op, true)
           case (_, SaveMode.Overwrite) =>
             val opts = buildUpsertOptions(durability)
-            () => coll.upsert(id, content, opts)
+            (() => coll.upsert(id, content, opts).map(_ => WriteRetry.Applied), true)
           case (_, SaveMode.ErrorIfExists | SaveMode.Ignore) =>
             val opts = buildInsertOptions(durability)
-            () => coll.insert(id, content, opts)
+            // A repeat fails with DocumentExistsException (which SaveMode.Ignore ignores).
+            val op   = () => coll.insert(id, content, opts).map(_ => WriteRetry.Applied)
+            (checkingContent(op), true)
           case _ =>
             throw new RuntimeException("Unexpected save mode " + mode)
         }
@@ -464,43 +672,126 @@ class RelationPartitionWriter(
     val opStarted = System.nanoTime()
     stats.recordConversion(opStarted - conversionStarted)
 
-    // Execute the KV op here.
-    op() match {
-      case Success(_) => stats.recordSuccess(System.nanoTime() - opStarted)
-      case Failure(t) => handleWriteError(t, id, mode, stats)
+    def failure(errors: Seq[Throwable]) = WriteFailure(
+      documentId = id,
+      bucket = writeConfig.bucket,
+      scope = writeConfig.scope.getOrElse(DefaultConstants.DefaultScopeName),
+      collection = writeConfig.collection.getOrElse(DefaultConstants.DefaultCollectionName),
+      errors = errors,
+      rowJson = encoded
+    )
+
+    // Execute the KV op here, with any retries.
+    var attemptStarted = opStarted
+    var retries        = 0
+    val errors         = mutable.ArrayBuffer.empty[Throwable]
+    val result = WriteRetry.run(
+      writeConfig.retryAttempts,
+      replaySafe,
+      // The retry's own backoff, or the partition's if that is longer.
+      sleep = d => backoff.pause(d),
+      decide = failures.filter(_.decidesRetries) match {
+        case None => (_, _, byDefault) => byDefault
+        case Some(f) =>
+          (retry, err, byDefault) => {
+            val attempt = failure(errors.toSeq :+ err).copy(
+              retriesRemaining = writeConfig.retryAttempts - retry + 1,
+              retriedByDefault = byDefault
+            )
+            val decision = f.runner.attemptFailed(attempt)
+            stats.recordRetryDecision(decision)
+            decision match {
+              case KeyValueWriteRetryDecision.Default => byDefault
+              case KeyValueWriteRetryDecision.Retry   => true
+              case KeyValueWriteRetryDecision.GiveUp  => false
+              case KeyValueWriteRetryDecision.FailTask =>
+                stats.recordFailure(id, err, " (the error handler is failing the task)")
+                throw err
+            }
+          }
+      },
+      onRetry = (n, err) => {
+        retries = n
+        errors += err
+        stats.recordRetry()
+        logInfo(
+          s"Partition ${stats.partition}: retrying write of document '$id' (retry $n of " +
+            s"${writeConfig.retryAttempts}) after ${PartitionWriteStats.describe(err)}"
+        )
+      },
+      // Once the partition has failed there's no point retrying, and doing so would delay the
+      // failure by up to RetryAttempts operation timeouts. The row's failure so far is still
+      // passed to the error handler.
+      stopped = partitionFailed
+    ) { n =>
+      // Retries have already waited, in `sleep`.
+      if (n == 0) backoff.pause()
+      attemptStarted = System.nanoTime()
+      val r = op()
+      backoff.record(r)
+      r
+    }
+
+    result match {
+      case Success(WriteRetry.Applied)      => stats.recordSuccess(System.nanoTime() - attemptStarted)
+      case Success(WriteRetry.Deduplicated) => stats.recordDeduplicated()
+      case Failure(t) =>
+        val note =
+          if (retries > 0) s" (after $retries retries)"
+          else if (
+            writeConfig.retryAttempts > 0 && !replaySafe &&
+            WriteRetry.classify(t) == WriteRetry.Ambiguous
+          ) {
+            " (not retried, as it may have been applied and its array or counter specs would " +
+              "then be applied twice: see KeyValueOptions.Idempotency)"
+          } else ""
+        errors += t
+        handleWriteError(failure(errors.toSeq), mode, stats, note, failures)
     }
   }
 
   private def handleWriteError(
-      throwable: Throwable,
-      documentId: String,
+      failure: WriteFailure,
       saveMode: SaveMode,
-      stats: PartitionWriteStats
+      stats: PartitionWriteStats,
+      note: String,
+      failures: Option[RelationPartitionWriter.Failures]
   ): Unit = {
+    val documentId = failure.documentId
+    val throwable  = failure.error
     // Special case for SaveMode.Ignore: silently ignore DocumentExistsException
     if (saveMode == SaveMode.Ignore && throwable.isInstanceOf[DocumentExistsException]) {
       stats.recordIgnored()
       logInfo(s"Document $documentId already exists, ignoring as per SaveMode.Ignore")
     } else {
-      stats.recordFailure(documentId, throwable)
-      if (errorHandler.isDefined || errorDocumentHandler.isDefined) {
-        val errorInfo = createErrorInfo(documentId, throwable)
-        // Will not block
-        errorQueueManager.enqueueError(errorInfo)
-      } else {
-        throw throwable
+      failures match {
+        case Some(f) =>
+          // On this writer thread, which waits for the handler: see FailureHandlerRunner.
+          val decision =
+            try f.runner.onFailure(failure)
+            catch {
+              case e: PartitionStoppedException =>
+                // The handler is broken, so this failure is only logged and counted.
+                stats.recordFailure(documentId, throwable, s"$note (not handled: ${e.getMessage})")
+                throw e
+            }
+          decision match {
+            case KeyValueWriteFailureDecision.Ignore => stats.recordIgnored()
+            case KeyValueWriteFailureDecision.Continue =>
+              stats.recordFailure(documentId, throwable, note)
+            case KeyValueWriteFailureDecision.FailTask =>
+              stats.recordFailure(
+                documentId,
+                throwable,
+                s"$note (the error handler is failing the task)"
+              )
+              throw throwable
+          }
+        case None =>
+          stats.recordFailure(documentId, throwable, note)
+          throw throwable
       }
     }
-  }
-
-  private def createErrorInfo(documentId: String, throwable: Throwable): KeyValueWriteErrorInfo = {
-    KeyValueWriteErrorInfo(
-      bucket = writeConfig.bucket,
-      scope = writeConfig.scope.getOrElse(DefaultConstants.DefaultScopeName),
-      collection = writeConfig.collection.getOrElse(DefaultConstants.DefaultCollectionName),
-      documentId = documentId,
-      throwable = Some(throwable)
-    )
   }
 
   def buildInsertOptions(durability: Durability): InsertOptions = {
@@ -542,6 +833,14 @@ object RelationPartitionWriter extends Logging {
     */
   val DefaultMaxConcurrentOps: Int = 16
 
+  /** A partition's error handling.
+    *
+    * @param decidesRetries
+    *   whether the handler is called for retry decisions: see
+    *   [[FailureHandlerRunner.decidesRetries]].
+    */
+  private[kv] case class Failures(runner: FailureHandlerRunner, decidesRetries: Boolean)
+
   /** Identifies which Spark task a log line came from, as "3 of 128".
     *
     * The count is taken from the TaskContext rather than passed down from the driver, as under AQE
@@ -563,12 +862,16 @@ object RelationPartitionWriter extends Logging {
     * The first exception thrown by `process` (or by `items`) fails the whole write. No further
     * items are processed, those already being processed are allowed to finish, and then the
     * exception is rethrown.
+    *
+    * `failed` is set as soon as the write has failed (including if the task is killed), so that
+    * items already being processed can stop early, e.g. rather than working through their retries.
     */
   private[kv] def writeAll[T <: AnyRef](
       items: Iterator[T],
       numThreads: Int,
       threadName: Int => String,
-      stats: PartitionWriteStats
+      stats: PartitionWriteStats,
+      failed: AtomicBoolean = new AtomicBoolean(false)
   )(process: T => Unit): Long = {
     val partition  = stats.partition
     val queue      = new ArrayBlockingQueue[T](numThreads)
@@ -578,6 +881,7 @@ object RelationPartitionWriter extends Logging {
 
     def fail(e: Throwable, context: String): Unit =
       if (firstError.compareAndSet(null, e)) {
+        failed.set(true)
         logError(
           s"Partition $partition: $context, so the write will fail and remaining items will be " +
             s"skipped: ${PartitionWriteStats.describe(e)}"
